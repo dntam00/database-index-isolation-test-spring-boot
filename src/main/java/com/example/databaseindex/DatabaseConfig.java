@@ -13,7 +13,7 @@ import org.springframework.transaction.support.TransactionTemplate;
 
 @Configuration
 @Profile("db")
-@PropertySource("classpath:application.properties")
+@PropertySource("classpath:application-postgresql.properties")
 @EnableTransactionManagement
 @ComponentScan
 public class DatabaseConfig {

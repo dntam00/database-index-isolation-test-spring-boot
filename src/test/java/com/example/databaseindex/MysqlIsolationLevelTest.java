@@ -27,7 +27,7 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 @EnableTransactionManagement
 @Transactional
 @ActiveProfiles("mysql")
-class ReadUncommittedIsolationTest {
+class MysqlIsolationLevelTest {
 
     @Autowired
     private PlatformTransactionManager transactionManager;
@@ -131,5 +131,90 @@ class ReadUncommittedIsolationTest {
         // Verify that a dirty read occurred
         assertEquals("modified", readValue.get());
         assertTrue(dirtyReadConfirmed.get(), "Should have read uncommitted data (dirty read)");
+    }
+
+    @Test
+    public void testReadCommitted_shouldOnlyReadCommittedData() throws InterruptedException {
+        // Number of update threads
+        final int NUM_THREADS = 5;
+
+        // Use a CountDownLatch to signal when the commit happens
+        CountDownLatch commitSignal = new CountDownLatch(1);
+
+        // Track which thread will commit (randomly chosen)
+        int committingThreadIndex = (int) (Math.random() * NUM_THREADS);
+        AtomicReference<String> expectedCommittedValue = new AtomicReference<>();
+
+        // Create and start all update threads
+        Thread[] updateThreads = new Thread[NUM_THREADS];
+        for (int i = 0; i < NUM_THREADS; i++) {
+            final int threadIndex = i;
+            final String newValue = "modified-by-thread-" + threadIndex;
+
+            // If this is the thread that will commit, remember its value
+            if (threadIndex == committingThreadIndex) {
+                expectedCommittedValue.set(newValue);
+            }
+
+            updateThreads[i] = new Thread(() -> {
+                TransactionTemplate txTemplate = new TransactionTemplate(transactionManager);
+                txTemplate.setPropagationBehavior(TransactionDefinition.PROPAGATION_REQUIRES_NEW);
+
+                txTemplate.execute(status -> {
+                    PersonEntity person = personRepository.findAll().get(0);
+                    person.setName(newValue);
+                    personRepository.saveAndFlush(person);
+
+                    // Only commit if this is the designated thread
+                    if (threadIndex == committingThreadIndex) {
+                        // Signal that the commit is happening
+                        commitSignal.countDown();
+                        return null;
+                    } else {
+                        // Roll back all other transactions
+                        status.setRollbackOnly();
+                        return null;
+                    }
+                });
+            });
+
+            updateThreads[i].start();
+        }
+
+        // Create and start the reader thread
+        AtomicReference<String> actualReadValue = new AtomicReference<>();
+        Thread readerThread = new Thread(() -> {
+            try {
+                // Wait for the commit signal
+                commitSignal.await();
+
+                // Add a small delay to ensure the commit has completed
+                Thread.sleep(200);
+
+                // Read with default isolation (READ_COMMITTED)
+                TransactionTemplate txTemplate = new TransactionTemplate(transactionManager);
+                txTemplate.setPropagationBehavior(TransactionDefinition.PROPAGATION_REQUIRES_NEW);
+
+                txTemplate.execute(status -> {
+                    PersonEntity person = personRepository.findAll().get(0);
+                    actualReadValue.set(person.getName());
+                    return null;
+                });
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            }
+        });
+
+        readerThread.start();
+
+        // Wait for all threads to complete
+        for (Thread thread : updateThreads) {
+            thread.join();
+        }
+        readerThread.join();
+
+        // Verify that only the committed value was read
+        assertEquals(expectedCommittedValue.get(), actualReadValue.get(),
+                     "Should only read the value from the committed transaction");
     }
 }
