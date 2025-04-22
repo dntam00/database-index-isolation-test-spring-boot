@@ -544,6 +544,112 @@ class MysqlIsolationLevelTest {
     }
 
     @Test
+    public void testRepeatableRead_shouldIncurLostUpdate() throws InterruptedException {
+        // Use CountDownLatch to coordinate thread execution
+        CountDownLatch bothReadComplete = new CountDownLatch(2);
+        CountDownLatch tx1FinishedRead = new CountDownLatch(1);
+        CountDownLatch tx2FinishedRead = new CountDownLatch(1);
+
+        // Track the final name value for verification
+        AtomicReference<String> tx1UpdatedValue = new AtomicReference<>("tx1-update");
+        AtomicReference<String> tx2UpdatedValue = new AtomicReference<>("tx2-update");
+        AtomicReference<String> finalValue = new AtomicReference<>();
+
+        // First transaction reads, waits for second to read, then updates
+        Thread transaction1 = new Thread(() -> {
+            TransactionTemplate txTemplate = new TransactionTemplate(transactionManager);
+            txTemplate.setIsolationLevel(TransactionDefinition.ISOLATION_REPEATABLE_READ);
+            txTemplate.setPropagationBehavior(TransactionDefinition.PROPAGATION_REQUIRES_NEW);
+
+            txTemplate.execute(status -> {
+                try {
+                    // Read the initial data
+                    PersonEntity person = personRepository.findAll().get(0);
+                    String originalName = person.getName();
+                    log.info("TX1: Read person with name: {}", originalName);
+
+                    // Signal that TX1 has completed its read
+                    tx1FinishedRead.countDown();
+
+                    // Wait for TX2 to also complete its read
+                    tx2FinishedRead.await();
+
+                    // Update the data
+                    person.setName(tx1UpdatedValue.get());
+                    personRepository.saveAndFlush(person);
+                    log.info("TX1: Updated person to: {}", tx1UpdatedValue.get());
+
+                    return null;
+                } catch (Exception e) {
+                    log.error("TX1: Exception: {}", e.getMessage(), e);
+                    status.setRollbackOnly();
+                    return null;
+                }
+            });
+        });
+
+        // Second transaction also reads, then waits, then updates
+        Thread transaction2 = new Thread(() -> {
+            TransactionTemplate txTemplate = new TransactionTemplate(transactionManager);
+            txTemplate.setIsolationLevel(TransactionDefinition.ISOLATION_READ_UNCOMMITTED);
+            txTemplate.setPropagationBehavior(TransactionDefinition.PROPAGATION_REQUIRES_NEW);
+
+            txTemplate.execute(status -> {
+                try {
+                    // Wait for TX1 to read first
+                    tx1FinishedRead.await();
+
+                    // Now TX2 reads
+                    PersonEntity person = personRepository.findAll().get(0);
+                    String originalName = person.getName();
+                    log.info("TX2: Read person with name: {}", originalName);
+
+                    // Signal TX2 has read
+                    tx2FinishedRead.countDown();
+
+                    // Wait a bit to let TX1 update first
+                    Thread.sleep(100);
+
+                    // Update with TX2's value
+                    person.setName(tx2UpdatedValue.get());
+                    personRepository.saveAndFlush(person);
+                    log.info("TX2: Updated person to: {}", tx2UpdatedValue.get());
+
+                    return null;
+                } catch (Exception e) {
+                    log.error("TX2: Exception: {}", e.getMessage(), e);
+                    status.setRollbackOnly();
+                    return null;
+                }
+            });
+        });
+
+        // Start both transactions
+        transaction1.start();
+        transaction2.start();
+
+        // Wait for both transactions to complete
+        transaction1.join();
+        transaction2.join();
+
+        // Check the final state in a separate transaction
+        TransactionTemplate verifyTx = new TransactionTemplate(transactionManager);
+        verifyTx.setPropagationBehavior(TransactionDefinition.PROPAGATION_REQUIRES_NEW);
+
+        String finalName = verifyTx.execute(status -> {
+            return personRepository.findAll().get(0).getName();
+        });
+
+        log.info("Final person name: {}", finalName);
+
+        // The last committer will "win" - likely TX2 since it waits for TX1 to update first
+        assertEquals(tx2UpdatedValue.get(), finalName,
+                     "The last transaction to commit overwrites earlier updates - demonstrating lost update");
+        assertNotEquals(tx1UpdatedValue.get(), finalName,
+                        "The first transaction's update was lost");
+    }
+
+    @Test
     public void testSerializable_shouldPreventWriteSkew() throws InterruptedException {
         CountDownLatch tx1ReadComplete = new CountDownLatch(1);
         CountDownLatch tx2CommitComplete = new CountDownLatch(1);
