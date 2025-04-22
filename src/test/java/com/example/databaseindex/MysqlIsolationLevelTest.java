@@ -24,8 +24,7 @@ import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicReference;
 
-import static org.junit.jupiter.api.Assertions.assertEquals;
-import static org.junit.jupiter.api.Assertions.assertTrue;
+import static org.junit.jupiter.api.Assertions.*;
 
 @RunWith(SpringRunner.class)
 @SpringBootTest
@@ -542,5 +541,107 @@ class MysqlIsolationLevelTest {
                    "With READ_UNCOMMITTED, should have observed multiple values including uncommitted ones");
         log.info("Total unique values observed: {}", observedValues.size());
         log.info("Values observed: {}", observedValues);
+    }
+
+    @Test
+    public void testSerializable_shouldPreventWriteSkew() throws InterruptedException {
+        CountDownLatch tx1ReadComplete = new CountDownLatch(1);
+        CountDownLatch tx2CommitComplete = new CountDownLatch(1);
+        AtomicBoolean tx1Success = new AtomicBoolean(true);
+
+        // First transaction reads data, waits for second transaction to complete,
+        // then attempts to update - should fail due to serialization
+        Thread transaction1 = new Thread(() -> {
+            TransactionTemplate txTemplate = new TransactionTemplate(transactionManager);
+            txTemplate.setIsolationLevel(TransactionDefinition.ISOLATION_SERIALIZABLE);
+            txTemplate.setPropagationBehavior(TransactionDefinition.PROPAGATION_REQUIRES_NEW);
+
+            try {
+                txTemplate.execute(status -> {
+                    try {
+                        // Read data
+                        PersonEntity person = personRepository.findAll().get(0);
+                        log.info("TX1: Read person with name: {}", person.getName());
+
+                        // Signal that T1 has read the data
+                        tx1ReadComplete.countDown();
+
+                        // Wait for T2 to complete its update and commit
+                        tx2CommitComplete.await();
+                        Thread.sleep(100); // Short delay to ensure T2 commit is fully processed
+
+                        person.setName("updated-by-tx1");
+                        personRepository.saveAndFlush(person);
+                        log.info("TX1: Updated person successfully");
+
+                        return null;
+                    } catch (Exception e) {
+                        log.info("TX1: Exception during update: {}", e.getMessage());
+                        status.setRollbackOnly();
+                        tx1Success.set(false);
+                        return null;
+                    }
+                });
+            } catch (Exception e) {
+                log.info("TX1: Transaction failed: {}", e.getMessage());
+                tx1Success.set(false);
+            }
+        });
+
+        // Second transaction reads data after first has read,
+        // then updates and commits
+        Thread transaction2 = new Thread(() -> {
+            try {
+                // Wait for T1 to read the data first
+                tx1ReadComplete.await();
+
+                TransactionTemplate txTemplate = new TransactionTemplate(transactionManager);
+                txTemplate.setIsolationLevel(TransactionDefinition.ISOLATION_SERIALIZABLE);
+                txTemplate.setPropagationBehavior(TransactionDefinition.PROPAGATION_REQUIRES_NEW);
+
+                txTemplate.execute(status -> {
+                    // Read and update
+                    PersonEntity person = personRepository.findAll().get(0);
+                    String originalName = person.getName();
+                    log.info("TX2: Read person with name: {}", originalName);
+
+                    // Now try to update - with SERIALIZABLE this should fail
+                    // due to serialization conflict
+                    // TX1 read will request a shared lock
+                    person.setName("updated-by-tx2");
+                    personRepository.saveAndFlush(person);
+                    log.info("TX2: Updated person to 'updated-by-tx2'");
+
+                    return null;
+                });
+
+                // Signal that T2 has committed
+                tx2CommitComplete.countDown();
+
+            } catch (Exception e) {
+                log.error("TX2: Exception: {}", e.getMessage());
+                tx2CommitComplete.countDown();
+            }
+        });
+
+        // Start the transactions
+        transaction1.start();
+        transaction2.start();
+
+        // Wait for both transactions to complete
+        transaction1.join();
+        transaction2.join();
+
+        // Verify final state
+        TransactionTemplate verifyTx = new TransactionTemplate(transactionManager);
+        verifyTx.setPropagationBehavior(TransactionDefinition.PROPAGATION_REQUIRES_NEW);
+
+        String finalName = verifyTx.execute(status -> {
+            return personRepository.findAll().get(0).getName();
+        });
+
+        log.info("Final person name: {}", finalName);
+        assertEquals("updated-by-tx1", finalName, "Person should have been updated by transaction 2");
+        assertFalse(tx1Success.get(), "Transaction 1 should have failed due to serialization conflict");
     }
 }
