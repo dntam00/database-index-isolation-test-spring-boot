@@ -564,7 +564,7 @@ class MysqlIsolationLevelTest {
             txTemplate.execute(status -> {
                 try {
                     // Read the initial data
-                    PersonEntity person = personRepository.findAll().get(0);
+                    PersonEntity person = personRepository.findAllForUpdateReadLock().get(0);
                     String originalName = person.getName();
                     log.info("TX1: Read person with name: {}", originalName);
 
@@ -605,7 +605,7 @@ class MysqlIsolationLevelTest {
                     log.info("TX2: Read person with name: {}", originalName);
 
                     // Signal TX2 has read
-                    tx2FinishedRead.countDown();
+//                    tx2FinishedRead.countDown();
 
                     // Wait a bit to let TX1 update first
                     Thread.sleep(100);
@@ -614,6 +614,8 @@ class MysqlIsolationLevelTest {
                     person.setName(tx2UpdatedValue.get());
                     personRepository.saveAndFlush(person);
                     log.info("TX2: Updated person to: {}", tx2UpdatedValue.get());
+
+                    tx2FinishedRead.countDown();
 
                     return null;
                 } catch (Exception e) {
