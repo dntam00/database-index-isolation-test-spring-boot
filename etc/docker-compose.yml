@@ -13,6 +13,9 @@ services:
     volumes:
       - db:/var/lib/mysql
       - ./init.sql:/docker-entrypoint-initdb.d/init.sql
+    command:
+      - --general-log=1
+      - --general-log-file=/var/lib/mysql/general.log
 volumes:
   db:
     driver: local

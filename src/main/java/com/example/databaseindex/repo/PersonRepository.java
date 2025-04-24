@@ -17,4 +17,8 @@ public interface PersonRepository extends JpaRepository<PersonEntity, Long> {
     @Lock(LockModeType.PESSIMISTIC_READ)
     @Query("SELECT p FROM PersonEntity p")
     List<PersonEntity> findAllForUpdateReadLock();
+
+    @Lock(LockModeType.PESSIMISTIC_READ)
+    @Query("SELECT p FROM PersonEntity p WHERE p.id > 0")
+    List<PersonEntity> findGreater();
 }

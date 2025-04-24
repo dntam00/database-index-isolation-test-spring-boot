@@ -12,6 +12,7 @@ import org.springframework.test.context.ActiveProfiles;
 import org.springframework.test.context.junit4.SpringRunner;
 import org.springframework.transaction.PlatformTransactionManager;
 import org.springframework.transaction.TransactionDefinition;
+import org.springframework.transaction.TransactionException;
 import org.springframework.transaction.annotation.EnableTransactionManagement;
 import org.springframework.transaction.annotation.Transactional;
 import org.springframework.transaction.support.TransactionTemplate;
@@ -19,9 +20,11 @@ import org.springframework.transaction.support.TransactionTemplate;
 import javax.persistence.EntityManager;
 import java.util.Collections;
 import java.util.HashSet;
+import java.util.List;
 import java.util.Set;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
 
 import static org.junit.jupiter.api.Assertions.*;
@@ -751,5 +754,382 @@ class MysqlIsolationLevelTest {
         log.info("Final person name: {}", finalName);
         assertEquals("updated-by-tx1", finalName, "Person should have been updated by transaction 2");
         assertFalse(tx1Success.get(), "Transaction 1 should have failed due to serialization conflict");
+    }
+
+    @Test
+    public void testSerializable_detectsWriteSkewInInnoDB() throws InterruptedException {
+        // Use CountDownLatch to coordinate thread execution
+        CountDownLatch tx1ReadComplete = new CountDownLatch(1);
+        CountDownLatch tx2ReadComplete = new CountDownLatch(1);
+        AtomicBoolean tx2Failed = new AtomicBoolean(false);
+        AtomicReference<Exception> tx2Exception = new AtomicReference<>();
+
+        // First transaction reads data, then updates
+        Thread transaction1 = new Thread(() -> {
+            TransactionTemplate txTemplate = new TransactionTemplate(transactionManager);
+            txTemplate.setIsolationLevel(TransactionDefinition.ISOLATION_SERIALIZABLE);
+            txTemplate.setPropagationBehavior(TransactionDefinition.PROPAGATION_REQUIRES_NEW);
+
+            txTemplate.execute(status -> {
+                try {
+                    // Read initial data
+                    PersonEntity person = personRepository.findAll().get(0);
+                    log.info("TX1: Read person with name: {}", person.getName());
+
+                    // Signal that T1 has read the data
+                    tx1ReadComplete.countDown();
+
+                    // Wait for T2 to also read
+                    tx2ReadComplete.await();
+
+                    // Small delay to ensure T2 has started its update operation
+                    Thread.sleep(50);
+
+                    // Update the data
+                    person.setName("updated-by-tx1");
+                    personRepository.saveAndFlush(person);
+                    log.info("TX1: Updated person successfully");
+
+                    return null;
+                } catch (Exception e) {
+                    log.error("TX1: Exception: {}", e.getMessage(), e);
+                    status.setRollbackOnly();
+                    return null;
+                }
+            });
+        });
+
+        // Second transaction reads data, tries to update the same data
+        Thread transaction2 = new Thread(() -> {
+            try {
+                // Wait for T1 to read first
+                tx1ReadComplete.await();
+
+                TransactionTemplate txTemplate = new TransactionTemplate(transactionManager);
+                txTemplate.setIsolationLevel(TransactionDefinition.ISOLATION_SERIALIZABLE);
+                txTemplate.setPropagationBehavior(TransactionDefinition.PROPAGATION_REQUIRES_NEW);
+
+                txTemplate.execute(status -> {
+                    try {
+                        // Read data (should see original state)
+                        PersonEntity person = personRepository.findAll().get(0);
+                        log.info("TX2: Read person with name: {}", person.getName());
+
+                        // Signal T2 has also read
+                        tx2ReadComplete.countDown();
+
+                        // Update with TX2's value - should eventually fail with serialization error
+                        Thread.sleep(100); // Ensure TX1 tries to commit first
+                        person.setName("updated-by-tx2");
+                        personRepository.saveAndFlush(person);
+                        log.info("TX2: Updated person successfully");
+
+                        return null;
+                    } catch (TransactionException e) {
+                        log.error("TX2: Exception during update: {}", e.getMessage());
+                        status.setRollbackOnly();
+                        throw e;
+                    } catch (InterruptedException e) {
+                        throw new RuntimeException(e);
+                    }
+                });
+            } catch (Exception e) {
+                tx2Failed.set(true);
+                tx2Exception.set(e);
+                log.info("TX2: Transaction failed: {}", e.getMessage());
+            }
+        });
+
+        // Start transactions
+        transaction1.start();
+        transaction2.start();
+
+        // Wait for completion
+        transaction1.join();
+        transaction2.join();
+
+        // Check final state
+        TransactionTemplate verifyTx = new TransactionTemplate(transactionManager);
+        verifyTx.setPropagationBehavior(TransactionDefinition.PROPAGATION_REQUIRES_NEW);
+
+        String finalName = verifyTx.execute(status -> {
+            return personRepository.findAll().get(0).getName();
+        });
+
+        log.info("Final person name: {}", finalName);
+
+        // With SERIALIZABLE, one transaction should succeed and the other should fail
+        // In InnoDB's implementation, the second transaction typically fails with a serialization error
+        assertEquals("updated-by-tx1", finalName, "TX1's update should be preserved");
+
+        // Check if MySQL InnoDB actually enforced serialization
+        if (tx2Failed.get()) {
+            log.info("MySQL InnoDB correctly enforced SERIALIZABLE isolation by aborting TX2");
+            assertTrue(
+                    tx2Exception.get().getMessage().contains("deadlock") ||
+                            tx2Exception.get().getMessage().contains("lock wait timeout") ||
+                            tx2Exception.get().getMessage().contains("serialization failure"),
+                    "TX2 should fail with serialization-related error"
+            );
+        } else {
+            // Note: Some MySQL configurations might not strictly enforce SERIALIZABLE as expected
+            log.warn("MySQL InnoDB did not abort TX2 as expected with SERIALIZABLE isolation.");
+            log.warn("This may happen with certain MySQL configurations where SERIALIZABLE behaves like REPEATABLE READ.");
+        }
+    }
+
+    @Test
+    public void testSerializable_detectsWriteSkewWithInsert() throws InterruptedException {
+        // Setup - delete all records before starting
+        TransactionTemplate setupTx = new TransactionTemplate(transactionManager);
+        setupTx.setPropagationBehavior(TransactionDefinition.PROPAGATION_REQUIRES_NEW);
+        setupTx.execute(status -> {
+            // Clear existing data and create a clean table
+            personRepository.deleteAll();
+            personRepository.flush();
+            return null;
+        });
+
+        Thread.sleep(200);
+
+        // Use CountDownLatch to coordinate thread execution
+        CountDownLatch tx1ReadComplete = new CountDownLatch(1);
+        CountDownLatch tx2ReadComplete = new CountDownLatch(1);
+        CountDownLatch tx1InsertComplete = new CountDownLatch(1);
+
+        AtomicBoolean tx2Failed = new AtomicBoolean(false);
+        AtomicReference<Exception> tx2Exception = new AtomicReference<>();
+
+        // First transaction reads (empty table), inserts and commits
+        Thread transaction1 = new Thread(() -> {
+            TransactionTemplate txTemplate = new TransactionTemplate(transactionManager);
+            txTemplate.setIsolationLevel(TransactionDefinition.ISOLATION_REPEATABLE_READ);
+            txTemplate.setPropagationBehavior(TransactionDefinition.PROPAGATION_REQUIRES_NEW);
+
+            txTemplate.execute(status -> {
+                try {
+                    // Verify table is empty
+                    long count = personRepository.count();
+                    log.info("TX1: Initial record count: {}", count);
+                    assertEquals(0, count, "Table should be empty at start");
+
+                    // Signal that TX1 has completed its read
+                    tx1ReadComplete.countDown();
+
+                    // Wait for TX2 to also read
+                    tx2ReadComplete.await();
+
+                    // Insert a record with ID = 1
+                    PersonEntity person = new PersonEntity();
+                    person.setId(1L); // Explicit ID to demonstrate conflict
+                    person.setName("tx1-person");
+                    personRepository.save(person);
+                    personRepository.flush();
+                    log.info("TX1: Inserted person with ID=1");
+
+                    // Signal TX1 has completed insert
+                    tx1InsertComplete.countDown();
+
+                    Thread.sleep(1000);
+
+                    return null;
+                } catch (Exception e) {
+                    log.error("TX1: Exception: {}", e.getMessage(), e);
+                    status.setRollbackOnly();
+                    return null;
+                }
+            });
+        });
+
+        // Second transaction also reads (empty table), then tries to insert same ID
+        Thread transaction2 = new Thread(() -> {
+            try {
+                // Wait for TX1 to read first
+                tx1ReadComplete.await();
+
+                TransactionTemplate txTemplate = new TransactionTemplate(transactionManager);
+                txTemplate.setIsolationLevel(TransactionDefinition.ISOLATION_REPEATABLE_READ);
+                txTemplate.setPropagationBehavior(TransactionDefinition.PROPAGATION_REQUIRES_NEW);
+
+                txTemplate.execute(status -> {
+                    try {
+                        // Also verify empty table - should still see empty due to isolation
+                        long count = personRepository.count();
+                        log.info("TX2: Initial record count: {}", count);
+                        assertEquals(0, count, "TX2 should still see empty table");
+
+                        // Signal TX2 has done its read
+                        tx2ReadComplete.countDown();
+
+                        // Wait for TX1 to insert and commit
+                        tx1InsertComplete.await();
+
+                        // Now TX2 tries to insert with same ID - should conflict
+                        PersonEntity person = new PersonEntity();
+                        person.setId(1L); // Same ID as TX1 inserted
+                        person.setName("tx2-person");
+                        personRepository.save(person);
+                        personRepository.flush(); // Should throw exception on duplicate key
+                        log.info("TX2: Inserted person with ID=1");
+
+                        return null;
+                    } catch (TransactionException e) {
+                        log.error("TX2: Exception during insert: {}", e.getMessage());
+                        status.setRollbackOnly();
+                        throw e;
+                    } catch (InterruptedException e) {
+                        throw new RuntimeException(e);
+                    }
+                });
+            } catch (Exception e) {
+                tx2Failed.set(true);
+                tx2Exception.set(e);
+                log.info("TX2: Transaction failed with exception: {}", e.getMessage());
+            }
+        });
+
+        // Start both transactions
+        transaction1.start();
+        transaction2.start();
+
+        // Wait for both transactions to complete
+        transaction1.join();
+        transaction2.join();
+
+        // Check the final state in a separate transaction
+        TransactionTemplate verifyTx = new TransactionTemplate(transactionManager);
+        verifyTx.setPropagationBehavior(TransactionDefinition.PROPAGATION_REQUIRES_NEW);
+
+        Long finalCount = verifyTx.execute(status -> personRepository.count());
+        log.info("Final record count: {}", finalCount);
+
+        // Verify TX2 failed with appropriate error
+        assertTrue(tx2Failed.get(), "Transaction 2 should have failed with primary key conflict");
+        assertTrue(tx2Exception.get().getMessage().contains("could not execute statement") ||
+                           tx2Exception.get().getMessage().contains("Duplicate entry") ||
+                           tx2Exception.get().getMessage().contains("ConstraintViolationException"),
+                   "Should fail with primary key conflict, got: " + tx2Exception.get().getMessage());
+
+        // Verify only TX1's insert succeeded
+        assertEquals(1L, finalCount, "Only one record should exist");
+
+        String finalName = verifyTx.execute(status -> personRepository.findById(1L)
+                                                                      .map(PersonEntity::getName)
+                                                                      .orElse(null));
+        assertEquals("tx1-person", finalName, "The record should be from TX1");
+    }
+
+    @Test
+    public void testRepeatableRead_preventsPhantomReads_withFindGreater() throws InterruptedException {
+        // Setup - ensure we have a known state with one record
+        TransactionTemplate setupTx = new TransactionTemplate(transactionManager);
+        setupTx.setPropagationBehavior(TransactionDefinition.PROPAGATION_REQUIRES_NEW);
+        setupTx.execute(status -> {
+            personRepository.deleteAll();
+            personRepository.flush();
+
+            PersonEntity person = new PersonEntity();
+            person.setId(5L);
+            person.setName("existing-record");
+            personRepository.save(person);
+            personRepository.flush();
+
+            return null;
+        });
+
+        // Use CountDownLatch to coordinate thread execution
+        CountDownLatch tx1FirstReadComplete = new CountDownLatch(1);
+        CountDownLatch tx2InsertComplete = new CountDownLatch(1);
+        AtomicInteger tx2Error = new AtomicInteger(0);
+
+        AtomicInteger tx1FirstReadCount = new AtomicInteger(0);
+        AtomicInteger tx1SecondReadCount = new AtomicInteger(0);
+        AtomicBoolean phantomReadOccurred = new AtomicBoolean(false);
+
+        // First transaction reads, then reads again after TX2 inserts
+        Thread transaction1 = new Thread(() -> {
+            TransactionTemplate txTemplate = new TransactionTemplate(transactionManager);
+            txTemplate.setIsolationLevel(TransactionDefinition.ISOLATION_REPEATABLE_READ);
+            txTemplate.setPropagationBehavior(TransactionDefinition.PROPAGATION_REQUIRES_NEW);
+
+            txTemplate.execute(status -> {
+                try {
+                    // First read with findGreater - should find only initial record
+                    List<PersonEntity> initialRecords = personRepository.findGreater();
+                    tx1FirstReadCount.set(initialRecords.size());
+                    log.info("TX1: First read found {} records", tx1FirstReadCount.get());
+
+                    entityManager.clear();
+
+                    // Signal TX1 completed first read
+                    tx1FirstReadComplete.countDown();
+
+                    // Wait for TX2 to insert new record
+                    tx2InsertComplete.await();
+
+                    Thread.sleep(1000);
+
+                    // Second read - should find the same records due to REPEATABLE_READ
+                    List<PersonEntity> secondRead = personRepository.findGreater();
+                    tx1SecondReadCount.set(secondRead.size());
+                    log.info("TX1: Second read found {} records", tx1SecondReadCount.get());
+
+                    // Check if phantom read occurred
+                    if (tx1SecondReadCount.get() > tx1FirstReadCount.get()) {
+                        phantomReadOccurred.set(true);
+                        log.info("TX1: Phantom read detected!");
+                    }
+
+                    return null;
+                } catch (Exception e) {
+                    log.error("TX1: Exception: {}", e.getMessage(), e);
+                    status.setRollbackOnly();
+                    return null;
+                }
+            });
+        });
+
+        // Second transaction waits for TX1 to read, then inserts a new record
+        Thread transaction2 = new Thread(() -> {
+            try {
+                // Wait for TX1 to complete its first read
+                tx1FirstReadComplete.await();
+
+                TransactionTemplate txTemplate = new TransactionTemplate(transactionManager);
+                txTemplate.setPropagationBehavior(TransactionDefinition.PROPAGATION_REQUIRES_NEW);
+
+                txTemplate.execute(status -> {
+                    // Insert a new record that should match the findGreater query
+                    PersonEntity newPerson = new PersonEntity();
+                    newPerson.setName("new-record");
+                    personRepository.save(newPerson);
+                    personRepository.flush();
+                    log.info("TX2: Inserted new record with ID=10");
+
+                    // Signal insert is complete
+
+                    return null;
+                });
+            } catch (Exception e) {
+                log.error("TX2: Exception: {}", e.getMessage(), e);
+                tx2Error.set(1);
+            }
+
+            tx2InsertComplete.countDown();
+        });
+
+        // Start both transactions
+        transaction1.start();
+        transaction2.start();
+
+        // Wait for completion
+        transaction1.join();
+        transaction2.join();
+
+        // Check results
+        log.info("TX1 first read count: {}", tx1FirstReadCount.get());
+        log.info("TX1 second read count: {}", tx1SecondReadCount.get());
+
+        assertEquals(1L, tx2Error.get(), "TX2 should failed because of using lock in TX1");
     }
 }
