@@ -18,14 +18,13 @@ import org.springframework.transaction.annotation.Transactional;
 import org.springframework.transaction.support.TransactionTemplate;
 
 import javax.persistence.EntityManager;
-import java.util.Collections;
-import java.util.HashSet;
-import java.util.List;
-import java.util.Set;
+import java.util.*;
 import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
+import java.util.stream.Collectors;
 
 import static org.junit.jupiter.api.Assertions.*;
 
@@ -1019,6 +1018,15 @@ class MysqlIsolationLevelTest {
         assertEquals("tx1-person", finalName, "The record should be from TX1");
     }
 
+    //+------------+-----------+--------------------+------------------------+-----------+
+    //| index_name | lock_type | lock_mode          | lock_data              | thread_id |
+    //+------------+-----------+--------------------+------------------------+-----------+
+    //| NULL       | TABLE     | IS                 | NULL                   |      1884 |
+    //| NULL       | TABLE     | IX                 | NULL                   |      1885 |
+    //| PRIMARY    | RECORD    | S                  | supremum pseudo-record |      1884 |
+    //| PRIMARY    | RECORD    | X,INSERT_INTENTION | supremum pseudo-record |      1885 |
+    //| PRIMARY    | RECORD    | S                  | 2                      |      1884 |
+    //+------------+-----------+--------------------+------------------------+-----------+
     @Test
     public void testRepeatableRead_preventsPhantomReads_withFindGreater() throws InterruptedException {
         // Setup - ensure we have a known state with one record
@@ -1029,7 +1037,6 @@ class MysqlIsolationLevelTest {
             personRepository.flush();
 
             PersonEntity person = new PersonEntity();
-            person.setId(5L);
             person.setName("existing-record");
             personRepository.save(person);
             personRepository.flush();
@@ -1055,7 +1062,7 @@ class MysqlIsolationLevelTest {
             txTemplate.execute(status -> {
                 try {
                     // First read with findGreater - should find only initial record
-                    List<PersonEntity> initialRecords = personRepository.findGreater();
+                    List<PersonEntity> initialRecords = personRepository.findGreaterAndSmaller();
                     tx1FirstReadCount.set(initialRecords.size());
                     log.info("TX1: First read found {} records", tx1FirstReadCount.get());
 
@@ -1131,5 +1138,398 @@ class MysqlIsolationLevelTest {
         log.info("TX1 second read count: {}", tx1SecondReadCount.get());
 
         assertEquals(1L, tx2Error.get(), "TX2 should failed because of using lock in TX1");
+    }
+
+    @Test
+    public void testRepeatableRead_withIntentionLock_preventsConflictingUpdates() throws InterruptedException {
+        // Setup - create a test record
+        AtomicInteger tx2Error = new AtomicInteger(0);
+
+        TransactionTemplate setupTx = new TransactionTemplate(transactionManager);
+        setupTx.setPropagationBehavior(TransactionDefinition.PROPAGATION_REQUIRES_NEW);
+        Long personId = setupTx.execute(status -> {
+            personRepository.deleteAll();
+            personRepository.flush();
+
+            PersonEntity person = new PersonEntity();
+            person.setName("initial-value");
+            personRepository.save(person);
+            personRepository.flush();
+
+            return person.getId();
+        });
+
+        log.info("Created test record with ID: {}", personId);
+
+        // Use CountDownLatch to coordinate thread execution
+        CountDownLatch tx1ReadComplete = new CountDownLatch(1);
+        CountDownLatch tx2StartedUpdate = new CountDownLatch(1);
+        CountDownLatch tx1UpdateComplete = new CountDownLatch(1);
+
+        AtomicBoolean tx2Failed = new AtomicBoolean(false);
+        AtomicReference<Exception> tx2Exception = new AtomicReference<>();
+
+        // First transaction: reads with SELECT FOR UPDATE (acquires X lock), then updates
+        Thread transaction1 = new Thread(() -> {
+            TransactionTemplate txTemplate = new TransactionTemplate(transactionManager);
+            txTemplate.setIsolationLevel(TransactionDefinition.ISOLATION_REPEATABLE_READ);
+            txTemplate.setPropagationBehavior(TransactionDefinition.PROPAGATION_REQUIRES_NEW);
+
+            txTemplate.execute(status -> {
+                try {
+                    // Read with FOR UPDATE - acquires exclusive lock
+                    PersonEntity person = personRepository.findByIdForUpdate(personId).orElseThrow();
+                    log.info("TX1: Read person with name: {} using FOR UPDATE", person.getName());
+
+                    // Signal TX1 completed read with lock
+                    tx1ReadComplete.countDown();
+
+                    // Wait for TX2 to attempt its update
+                    tx2StartedUpdate.await();
+
+                    // Delay to ensure TX2 has time to attempt lock acquisition
+                    Thread.sleep(500);
+
+                    // Update the data
+                    person.setName("tx1-updated-value");
+                    personRepository.save(person);
+                    log.info("TX1: Updated person to: tx1-updated-value");
+
+                    // Signal TX1 completed its update
+                    tx1UpdateComplete.countDown();
+
+                    return null;
+                } catch (Exception e) {
+                    log.error("TX1: Exception: {}", e.getMessage(), e);
+                    status.setRollbackOnly();
+                    return null;
+                }
+            });
+        });
+
+        // Second transaction: attempts to update the same record concurrently
+        Thread transaction2 = new Thread(() -> {
+            try {
+                // Wait for TX1 to acquire its lock first
+                tx1ReadComplete.await();
+
+                TransactionTemplate txTemplate = new TransactionTemplate(transactionManager);
+                txTemplate.setIsolationLevel(TransactionDefinition.ISOLATION_REPEATABLE_READ);
+                txTemplate.setPropagationBehavior(TransactionDefinition.PROPAGATION_REQUIRES_NEW);
+                // Set a timeout to avoid waiting indefinitely
+//                txTemplate.setTimeout(2);  // 2 seconds timeout
+
+                txTemplate.execute(status -> {
+                    try {
+                        // Signal TX2 is starting update attempt
+//                        tx2StartedUpdate.countDown();
+
+                        // Attempt to update - should be blocked by TX1's lock
+                        List<PersonEntity> persons = personRepository.findGreaterForUpdateReadLock();
+                        log.info("TX2: Read person with name: {} using FOR UPDATE", persons.size());
+
+                        tx2StartedUpdate.countDown();
+
+                        // If we get here, update the person
+//                        person.setName("tx2-updated-value");
+//                        personRepository.save(person);
+//                        log.info("TX2: Updated person to: tx2-updated-value");
+
+                        return null;
+                    } catch (Exception e) {
+                        tx2Error.set(1);
+                        log.error("TX2: Exception during update: {}", e.getMessage());
+                        status.setRollbackOnly();
+                        throw e;
+                    }
+                });
+            } catch (Exception e) {
+                tx2Error.set(1);
+                tx2Failed.set(true);
+                tx2Exception.set(e);
+                log.info("TX2: Transaction failed with exception: {}", e.getMessage());
+            }
+            tx2StartedUpdate.countDown();
+        });
+
+        // Start both transactions
+        transaction1.start();
+        transaction2.start();
+
+        // Wait for both transactions to complete
+        transaction1.join();
+        transaction2.join();
+
+        assertEquals(1L, tx2Error.get(), "TX2 should failed because of using lock in TX1");
+    }
+
+    @Test
+    public void testRepeatableRead_plainSelectVsSelectForUpdate() throws InterruptedException {
+        // Setup - clear and initialize test data
+        TransactionTemplate setupTx = new TransactionTemplate(transactionManager);
+        setupTx.setPropagationBehavior(TransactionDefinition.PROPAGATION_REQUIRES_NEW);
+        setupTx.execute(status -> {
+            personRepository.deleteAll();
+            personRepository.flush();
+
+            // Create one initial record
+            PersonEntity person = new PersonEntity();
+            person.setId(5L);
+            person.setName("initial-record");
+            personRepository.save(person);
+            personRepository.flush();
+
+            return null;
+        });
+
+        // Use CountDownLatch to coordinate thread execution
+        CountDownLatch plainSelectDone = new CountDownLatch(1);
+        CountDownLatch insertDone = new CountDownLatch(1);
+
+        AtomicInteger plainSelectCount = new AtomicInteger(0);
+        AtomicInteger forUpdateSelectCount = new AtomicInteger(0);
+
+        // Main transaction that performs plain SELECT and SELECT FOR UPDATE
+        Thread mainTransaction = new Thread(() -> {
+            TransactionTemplate txTemplate = new TransactionTemplate(transactionManager);
+            txTemplate.setIsolationLevel(TransactionDefinition.ISOLATION_REPEATABLE_READ);
+            txTemplate.setPropagationBehavior(TransactionDefinition.PROPAGATION_REQUIRES_NEW);
+
+            txTemplate.execute(status -> {
+                try {
+                    // First read with plain SELECT
+                    List<PersonEntity> initialRecords = personRepository.findAll();
+                    plainSelectCount.set(initialRecords.size());
+                    log.info("TX1: Plain SELECT found {} records", plainSelectCount.get());
+
+                    // Signal that plain SELECT is done
+                    plainSelectDone.countDown();
+
+                    // Wait for insert to complete
+                    insertDone.await(5, TimeUnit.SECONDS);
+
+                    // Second read with plain SELECT - should return same count due to REPEATABLE READ
+                    List<PersonEntity> secondRead = personRepository.findAll();
+                    log.info("TX1: Second plain SELECT found {} records", secondRead.size());
+                    assertEquals(plainSelectCount.get(), secondRead.size(),
+                                 "Plain SELECT should return same count due to repeatable read isolation");
+
+                    // Now try with SELECT FOR UPDATE - should see the newly inserted records
+                    // This is because FOR UPDATE acquires locks and re-reads the data
+                    List<PersonEntity> forUpdateRead = personRepository.findAllForUpdate();
+                    forUpdateSelectCount.set(forUpdateRead.size());
+                    log.info("TX1: SELECT FOR UPDATE found {} records", forUpdateSelectCount.get());
+
+                    return null;
+                } catch (Exception e) {
+                    log.error("TX1: Exception: {}", e.getMessage(), e);
+                    status.setRollbackOnly();
+                    return null;
+                }
+            });
+        });
+
+        // Second transaction that inserts a new record
+        Thread insertTransaction = new Thread(() -> {
+            try {
+                // Wait for first transaction to complete its plain SELECT
+                plainSelectDone.await();
+
+                TransactionTemplate txTemplate = new TransactionTemplate(transactionManager);
+                txTemplate.setPropagationBehavior(TransactionDefinition.PROPAGATION_REQUIRES_NEW);
+
+                txTemplate.execute(status -> {
+                    // Insert a new record
+                    PersonEntity newPerson = new PersonEntity();
+                    newPerson.setId(10L);
+                    newPerson.setName("inserted-record");
+                    personRepository.save(newPerson);
+                    personRepository.flush();
+                    log.info("TX2: Inserted new record with ID=10");
+
+                    return null;
+                });
+
+                // Signal that insert is complete
+                insertDone.countDown();
+            } catch (Exception e) {
+                log.error("TX2: Exception: {}", e.getMessage(), e);
+                insertDone.countDown(); // Ensure latch is released
+            }
+        });
+
+        // Start both transactions
+        mainTransaction.start();
+        insertTransaction.start();
+
+        // Wait for completion
+        mainTransaction.join();
+        insertTransaction.join();
+
+        // Verify results in a separate transaction
+        TransactionTemplate verifyTx = new TransactionTemplate(transactionManager);
+        verifyTx.setPropagationBehavior(TransactionDefinition.PROPAGATION_REQUIRES_NEW);
+
+        Long finalCount = verifyTx.execute(status -> personRepository.count());
+        log.info("Final record count: {}", finalCount);
+        assertEquals(2L, finalCount.longValue(), "Should have two records in total");
+
+        // Check the counts from our test
+        assertEquals(1, plainSelectCount.get(), "Plain SELECT should have seen only the initial record");
+        assertEquals(2, forUpdateSelectCount.get(), "SELECT FOR UPDATE should have seen both records");
+
+        log.info("Test completed - Plain SELECT count: {}, SELECT FOR UPDATE count: {}",
+                 plainSelectCount.get(), forUpdateSelectCount.get());
+
+        // Main assertion: in REPEATABLE READ, SELECT FOR UPDATE sees new records but plain SELECT doesn't
+        assertTrue(forUpdateSelectCount.get() > plainSelectCount.get(),
+                   "SELECT FOR UPDATE should see more records than plain SELECT in REPEATABLE READ isolation");
+    }
+
+    // Empty lock
+    // SELECT index_name, lock_type, lock_mode, lock_data, thread_id FROM performance_schema.data_locks ORDER BY index_name, lock_data DESC;
+    @Test
+    public void testQueryLock() throws InterruptedException {
+        TransactionTemplate setupTx = new TransactionTemplate(transactionManager);
+        setupTx.setPropagationBehavior(TransactionDefinition.PROPAGATION_REQUIRES_NEW);
+        setupTx.execute(status -> {
+            personRepository.deleteAll();
+            personRepository.flush();
+
+            // Create one initial record
+            PersonEntity person = new PersonEntity();
+            person.setId(5L);
+            person.setName("initial-record");
+            personRepository.save(person);
+            personRepository.flush();
+
+            return null;
+        });
+
+        Thread mainTransaction = new Thread(() -> {
+            TransactionTemplate txTemplate = new TransactionTemplate(transactionManager);
+            txTemplate.setIsolationLevel(TransactionDefinition.ISOLATION_REPEATABLE_READ);
+            txTemplate.setPropagationBehavior(TransactionDefinition.PROPAGATION_REQUIRES_NEW);
+
+            txTemplate.execute(status -> {
+                try {
+                    // First read with plain SELECT
+                    List<PersonEntity> initialRecords = personRepository.findAll();
+                    Thread.sleep(10000);
+
+                    return null;
+                } catch (Exception e) {
+                    log.error("TX1: Exception: {}", e.getMessage(), e);
+                    status.setRollbackOnly();
+                    return null;
+                }
+            });
+        });
+
+        mainTransaction.start();
+        mainTransaction.join();
+    }
+
+    @Test
+    public void testRepeatableRead_plainSelectVsSelectForUpdate_withDelete() throws InterruptedException {
+        // Setup - initialize test data with multiple records
+        TransactionTemplate setupTx = new TransactionTemplate(transactionManager);
+        setupTx.setPropagationBehavior(TransactionDefinition.PROPAGATION_REQUIRES_NEW);
+        setupTx.execute(status -> {
+            PersonEntity person1 = new PersonEntity();
+            person1.setName("record-2");
+            person1.setAge(5);
+            personRepository.save(person1);
+
+            personRepository.flush();
+            return null;
+        });
+
+        Thread.sleep(200);
+
+        // Use CountDownLatch to coordinate thread execution
+        CountDownLatch plainSelectDone = new CountDownLatch(1);
+        CountDownLatch deleteDone = new CountDownLatch(1);
+
+        // Main transaction with plain SELECT and later SELECT FOR UPDATE
+        Thread mainTransaction = new Thread(() -> {
+            TransactionTemplate txTemplate = new TransactionTemplate(transactionManager);
+            txTemplate.setIsolationLevel(TransactionDefinition.ISOLATION_REPEATABLE_READ);
+            txTemplate.setPropagationBehavior(TransactionDefinition.PROPAGATION_REQUIRES_NEW);
+
+            try {
+                txTemplate.execute(status -> {
+                    try {
+                        // First read with plain SELECT
+                        PersonEntity initialRecord = personRepository.findById(1L).orElse(new PersonEntity());
+                        log.info("TX1: Plain SELECT found records: {}", initialRecord.getName());
+                        entityManager.clear();
+
+                        // Signal that plain SELECT is done
+                        plainSelectDone.countDown();
+
+                        // Wait for delete to complete
+                        deleteDone.await(5, TimeUnit.SECONDS);
+
+                        // Second plain SELECT - should return same count due to REPEATABLE READ
+                        PersonEntity afterRecord = personRepository.findById(1L).orElse(new PersonEntity());
+                        afterRecord.setName("updated");
+                        personRepository.save(afterRecord);
+
+
+                        log.info("TX1: UPDATE");
+
+                        return null;
+                    } catch (Exception e) {
+                        log.error("TX1: Exception: {}", e.getMessage(), e);
+                        status.setRollbackOnly();
+                        return null;
+                    }
+                });
+            } catch (Exception ex) {
+                log.error("TX1: Commit failed: {}", ex.getMessage(), ex);
+            }
+        });
+
+        // Second transaction that deletes a record
+        Thread deleteTransaction = new Thread(() -> {
+            try {
+                // Wait for first transaction to complete its plain SELECT
+                plainSelectDone.await();
+
+                TransactionTemplate txTemplate = new TransactionTemplate(transactionManager);
+                txTemplate.setPropagationBehavior(TransactionDefinition.PROPAGATION_REQUIRES_NEW);
+
+                txTemplate.execute(status -> {
+                    // Delete record with ID=5
+                    personRepository.deleteById(1L);
+                    personRepository.flush();
+                    log.info("TX2: Deleted record with ID=0");
+                    return null;
+                });
+
+                // Signal that delete is complete
+                deleteDone.countDown();
+            } catch (Exception e) {
+                log.error("TX2: Exception: {}", e.getMessage(), e);
+                deleteDone.countDown(); // Ensure latch is released
+            }
+        });
+
+        // Start both transactions
+        mainTransaction.start();
+        deleteTransaction.start();
+
+        // Wait for completion
+        mainTransaction.join();
+        deleteTransaction.join();
+
+        // Verify final state in a separate transaction
+        TransactionTemplate verifyTx = new TransactionTemplate(transactionManager);
+        verifyTx.setPropagationBehavior(TransactionDefinition.PROPAGATION_REQUIRES_NEW);
+
+        Long finalCount = verifyTx.execute(status -> personRepository.count());
+        log.info("Final record count: {}", finalCount);
+        assertEquals(1L, finalCount.longValue(), "Should have one record remaining after deletion");
     }
 }

@@ -22,5 +22,7 @@ public class PersonEntity {
     
     @Column(name = "name")
     private String name;
-    
+
+    @Column(name = "age")
+    private Integer age;
 }
